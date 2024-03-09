@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+pub usingnamespace @import("stringify.zig");
 pub const Value = union(enum) {
     null,
     bool: bool,
@@ -22,6 +23,35 @@ pub const Value = union(enum) {
         _ = allocator;
         _ = options;
         return source;
+    }
+    pub fn zonStringify(value: Value, jws: anytype) !void {
+        switch (value) {
+            .null => try jws.write(null),
+            .bool => |inner| try jws.write(inner),
+            .int => |inner| try jws.write(inner),
+            .float => |inner| try jws.write(inner),
+            .number_string => |inner| try jws.print("{s}", .{inner}),
+            .string => |inner| try jws.write(inner),
+            .array => |inner| try jws.write(inner),
+            .object => |inner| {
+                try jws.beginObject();
+                var it = inner.iterator();
+                while (it.next()) |entry| {
+                    try jws.objectField(entry.key_ptr.*);
+                    try jws.write(entry.value_ptr.*);
+                }
+                try jws.endObject();
+            },
+            .empty => {
+                try jws.beginArray();
+                try jws.endArray();
+            },
+            // as int (?)
+            .char => |inner| try jws.write(inner),
+            .@"enum" => |inner| {
+                try jws.enumLiteralValue(inner);
+            },
+        }
     }
 };
 
@@ -294,7 +324,7 @@ pub fn innerParseFromValue(
                     if (f < std.math.minInt(T)) return error.Overflow;
                     return @as(T, @intFromFloat(f));
                 },
-                .int => |i| {
+                .int, .char => |i| {
                     if (i > std.math.maxInt(T)) return error.Overflow;
                     if (i < std.math.minInt(T)) return error.Overflow;
                     return @as(T, @intCast(i));
