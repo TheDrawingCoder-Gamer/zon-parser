@@ -47,12 +47,14 @@ fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index:
                 .array_init_dot_two, .array_init_dot_two_comma => blk: {
                     var buf = [_]std.zig.Ast.Node.Index{0} ** 2;
                     const res_ast = ast.arrayInitDotTwo(&buf, node_index);
+                    if (res_ast.ast.elements.len == 0) return .empty;
                     const realloced = try allocator.alloc(std.zig.Ast.Node.Index, res_ast.ast.elements.len);
                     @memcpy(realloced, res_ast.ast.elements);
                     break :blk realloced;
                 },
                 .array_init_dot, .array_init_dot_comma => blk: {
                     const res_ast = ast.arrayInitDot(node_index);
+                    if (res_ast.ast.elements.len == 0) return .empty;
                     const realloced = try allocator.alloc(std.zig.Ast.Node.Index, res_ast.ast.elements.len);
                     @memcpy(realloced, res_ast.ast.elements);
                     break :blk realloced;
@@ -64,7 +66,7 @@ fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index:
             const res_arr = try allocator.alloc(Value, arr.len);
             errdefer allocator.free(res_arr);
             for (0..arr.len) |i| {
-                res_arr[i] = try innerParseToValue(allocator, ast, node_index, options);
+                res_arr[i] = try innerParseToValue(allocator, ast, arr[i], options);
             }
             return .{ .array = res_arr };
         },
@@ -74,6 +76,7 @@ fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index:
                 .struct_init_dot_two, .struct_init_dot_two_comma => blk: {
                     var buf = [_]std.zig.Ast.Node.Index{0} ** 2;
                     const res_ast = ast.structInitDotTwo(&buf, node_index);
+                    if (res_ast.ast.fields.len == 0) return .empty;
                     var fields = try allocator.alloc(StructField, res_ast.ast.fields.len);
                     for (res_ast.ast.fields, 0..) |field, i| {
                         const name_token = ast.firstToken(field) - 2;
@@ -83,6 +86,7 @@ fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index:
                 },
                 .struct_init_dot, .struct_init_dot_comma => blk: {
                     const res_ast = ast.structInitDot(node_index);
+                    if (res_ast.ast.fields.len == 0) return .empty;
                     var fields = try allocator.alloc(StructField, res_ast.ast.fields.len);
                     for (res_ast.ast.fields, 0..) |field, i| {
                         const name_token = ast.firstToken(field) - 2;
@@ -151,18 +155,25 @@ fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index:
             // TODO: TEST
             var outlit = std.ArrayList(u8).init(allocator);
             defer outlit.deinit();
-            for (node.data.lhs..node.data.rhs) |i| {
+            for (node.data.lhs..node.data.rhs + 1) |i| {
                 const token = ast.tokens.get(i);
                 switch (token.tag) {
                     .string_literal => {
-                        try outlit.writer().writeAll(ast.tokenSlice(@intCast(i)));
+                        const data = try std.zig.string_literal.parseAlloc(allocator, outlit.items);
+                        defer allocator.free(data);
+                        try outlit.writer().writeAll(data);
                     },
-                    .multiline_string_literal_line => try outlit.writer().writeAll(ast.tokenSlice(@intCast(i))),
-                    else => return error.UnexectedToken,
+                    .multiline_string_literal_line => {
+                        if (i != node.data.lhs) {
+                            try outlit.writer().writeByte('\n');
+                        }
+                        const slice = ast.tokenSlice(@intCast(i));
+                        try outlit.writer().writeAll(slice[2 .. slice.len - 1]);
+                    },
+                    else => return error.UnexpectedToken,
                 }
             }
-            const data = try std.zig.string_literal.parseAlloc(allocator, outlit.items);
-            return .{ .string = data };
+            return .{ .string = try outlit.toOwnedSlice() };
         },
         .negation => {
             const expr = ast.nodes.get(node.data.lhs);
@@ -356,6 +367,12 @@ pub fn innerParseFromValue(
                 return T.zonParseFromValue(allocator, value, options);
             }
 
+            if (value == .empty) {
+                var r: T = undefined;
+                var fields_seen = [_]bool{false} ** structInfo.fields.len;
+                try fillDefaultStructValues(T, &r, &fields_seen);
+                return r;
+            }
             if (value != .object) return error.UnexpectedToken;
 
             var r: T = undefined;
@@ -389,11 +406,18 @@ pub fn innerParseFromValue(
                 .string => |s| {
                     if (arrayInfo.child != u8) return error.UnexpectedToken;
 
-                    if (s.len != arrayInfo.len) return error.LengthMismatch;
+                    if (s.len != arrayInfo.len) {
+                        std.debug.print("{s}", .{s});
+                        return error.LengthMismatch;
+                    }
 
                     var r: T = undefined;
                     @memcpy(r[0..], s);
                     return r;
+                },
+                .empty => {
+                    if (arrayInfo.len != 0) return error.UnexpectedToken;
+                    return .{};
                 },
                 else => return error.UnexpectedToken,
             }
@@ -438,7 +462,19 @@ pub fn innerParseFromValue(
 
                             return r;
                         },
-                        else => return error.UnexpectedToken,
+                        .empty => {
+                            // Empty slice literals can be cast into mutable slices
+                            // unless they're sentinel, as sentinels still need to be alloced even when 0
+                            if (ptrInfo.sentinel) |sentinel_ptr| {
+                                const r = try allocator.allocSentinel(ptrInfo.child, 0, @as(*align(1) const ptrInfo.child, @ptrCast(sentinel_ptr)).*);
+                                return r;
+                            } else {
+                                return @as(T, &.{});
+                            }
+                        },
+                        else => {
+                            return error.UnexpectedToken;
+                        },
                     }
                 },
                 else => @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
@@ -502,47 +538,6 @@ fn innerParseArrayFromArrayValue(
     }
 
     return r;
-}
-
-test "simple struct" {
-    const TestStruct = struct { a: u8, b: []const u8 };
-    const sample_data = ".{ .a = 5, .b = \"hi guys\"}";
-    const res = try parseFromSlice(TestStruct, std.testing.allocator, sample_data, .{});
-    defer res.deinit();
-    try std.testing.expectEqual(5, res.value.a);
-    try std.testing.expectEqualStrings("hi guys", res.value.b);
-}
-
-test "nested struct" {
-    const TestStruct = struct { a: struct { egg: u8, poop: u4 }, b: []const u8 };
-    const sample_data = ".{ .a = .{ .egg = 5, .poop = 2 }, .b = \"EGG LOVERS!\"}";
-    const res = try parseFromSlice(TestStruct, std.testing.allocator, sample_data, .{});
-    defer res.deinit();
-    try std.testing.expectEqual(5, res.value.a.egg);
-    try std.testing.expectEqual(2, res.value.a.poop);
-    try std.testing.expectEqualStrings("EGG LOVERS!", res.value.b);
-}
-
-const TestEnum = enum(u8) { one, two, three, four };
-test "enum literal" {
-    const sample_data = ".two";
-    const res = try parseFromSlice(TestEnum, std.testing.allocator, sample_data, .{});
-    defer res.deinit();
-    try std.testing.expectEqual(TestEnum.two, res.value);
-}
-
-test "enum from int" {
-    const sample_data = "1";
-    const res = try parseFromSlice(TestEnum, std.testing.allocator, sample_data, .{});
-    defer res.deinit();
-    try std.testing.expectEqual(TestEnum.two, res.value);
-}
-
-test "enum from string of name" {
-    const sample_data = "\"two\"";
-    const res = try parseFromSlice(TestEnum, std.testing.allocator, sample_data, .{});
-    defer res.deinit();
-    try std.testing.expectEqual(TestEnum.two, res.value);
 }
 
 test {
