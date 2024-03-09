@@ -180,6 +180,11 @@ fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index:
             switch (expr.tag) {
                 .number_literal => {
                     var data = try numberSliceToValue(allocator, ast.tokenSlice(expr.main_token));
+                    // LOL
+                    errdefer switch (data) {
+                        .number_string => |s| allocator.free(s),
+                        else => {},
+                    };
                     switch (data) {
                         .float => |*d| d.* = -d.*,
                         .int => |*i| i.* = -i.*,
@@ -204,6 +209,7 @@ fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index:
 
 pub fn parseLeaky(comptime T: type, allocator: Allocator, source: anytype, options: ParseOptions) !T {
     var data = std.ArrayList(u8).init(allocator);
+    defer data.deinit();
     try source.readAllArrayList(&data, std.math.maxInt(usize));
     try data.append(0);
     const res = try data.toOwnedSliceSentinel(0);
@@ -356,6 +362,7 @@ pub fn innerParseFromValue(
                 if (value.array.items.len != structInfo.fields.len) return error.UnexpectedToken;
 
                 var r: T = undefined;
+                // this _can_ leak, but that's why parse and parseFromSlice exist over parseLeaky
                 inline for (0..structInfo.fields.len, value.array.items) |i, item| {
                     r[i] = try innerParseFromValue(structInfo.fields[i].type, allocator, item, options);
                 }
@@ -386,6 +393,7 @@ pub fn innerParseFromValue(
                     if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
                     if (std.mem.eql(u8, field.name, field_name)) {
                         std.debug.assert(!fields_seen[i]); // TODO: parseToValue check for duplicate
+                        // can leak but that is why the safe parses exist
                         @field(r, field.name) = try innerParseFromValue(field.type, allocator, kv.value_ptr.*, options);
                         fields_seen[i] = true;
                         break;
@@ -407,7 +415,6 @@ pub fn innerParseFromValue(
                     if (arrayInfo.child != u8) return error.UnexpectedToken;
 
                     if (s.len != arrayInfo.len) {
-                        std.debug.print("{s}", .{s});
                         return error.LengthMismatch;
                     }
 
@@ -434,6 +441,7 @@ pub fn innerParseFromValue(
             switch (ptrInfo.size) {
                 .One => {
                     const r: *ptrInfo.child = try allocator.create(ptrInfo.child);
+                    errdefer allocator.destroy(r);
                     r.* = try innerParseFromValue(ptrInfo.child, allocator, value, options);
                     return r;
                 },
@@ -444,7 +452,7 @@ pub fn innerParseFromValue(
                                 try allocator.allocSentinel(ptrInfo.child, arr.len, @as(*align(1) const ptrInfo.child, @ptrCast(sentinel_ptr)).*)
                             else
                                 try allocator.alloc(ptrInfo.child, arr.len);
-
+                            errdefer allocator.free(r);
                             for (arr, r) |item, *dest| {
                                 dest.* = try innerParseFromValue(ptrInfo.child, allocator, item, options);
                             }
@@ -458,6 +466,8 @@ pub fn innerParseFromValue(
                                 try allocator.allocSentinel(ptrInfo.child, s.len, @as(*align(1) const ptrInfo.child, @ptrCast(sentinel_ptr)).*)
                             else
                                 try allocator.alloc(ptrInfo.child, s.len);
+                            // no errors but it never hurts
+                            errdefer allocator.free(r);
                             @memcpy(r[0..], s);
 
                             return r;
