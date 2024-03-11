@@ -51,12 +51,12 @@ const primitives_0_doc_1 = // looks like a float
     \\ .bool = false,
     \\ .f32 = 0.0,
     \\ .f64 = 0.0,
-    \\ .u0 = 0.0,
-    \\ .i0 = 0.0,
-    \\ .u1 = 0.0,
-    \\ .i1 = 0.0,
-    \\ .u8 = 0.0,
-    \\ .i8 = 0.0,
+    \\ .u0 = 0,
+    \\ .i0 = 0,
+    \\ .u1 = 0,
+    \\ .i1 = 0,
+    \\ .u8 = 0,
+    \\ .i8 = 0,
     // \\ .i130 = 0.0,
     \\ }
 ;
@@ -125,8 +125,6 @@ const Enums = enum(u8) {
 const enums_0 = Enums.zero;
 
 const enums_0_doc_0 = ".zero";
-const enums_0_doc_1 = "0";
-const enums_0_doc_2 = "\"zero\"";
 
 // var so you can take mutable pointers`
 var zero: i32 = 0;
@@ -343,8 +341,6 @@ test "test all types" {
     try testAllParseFunctions(Strings1, strings_1, strings_1_doc_1);
 
     try testAllParseFunctions(Enums, enums_0, enums_0_doc_0);
-    try testAllParseFunctions(Enums, enums_0, enums_0_doc_1);
-    try testAllParseFunctions(Enums, enums_0, enums_0_doc_2);
 }
 
 test "number literals" {

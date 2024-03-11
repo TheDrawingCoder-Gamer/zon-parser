@@ -2,6 +2,8 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+const Ast = std.zig.Ast;
+const NodeIndex = std.zig.Ast.Node.Index;
 pub usingnamespace @import("stringify.zig");
 pub const Value = union(enum) {
     null,
@@ -23,6 +25,9 @@ pub const Value = union(enum) {
         _ = allocator;
         _ = options;
         return source;
+    }
+    pub fn zonParse(allocator: Allocator, ast: Ast, node_index: NodeIndex, options: ParseOptions) !Value {
+        return try innerParseToValue(allocator, ast, node_index, options);
     }
     pub fn zonStringify(value: Value, jws: anytype) !void {
         switch (value) {
@@ -61,38 +66,196 @@ fn cloned(comptime T: type, alloc: std.mem.Allocator, source: []const T) ![]T {
     @memcpy(data, source);
     return data;
 }
-fn parseToValue(allocator: std.mem.Allocator, source: [:0]const u8, options: ParseOptions) !Value {
-    var ast = try std.zig.Ast.parse(allocator, source, .zon);
-    defer ast.deinit(allocator);
-    const main_index = ast.nodes.get(0).data.lhs;
-    return try innerParseToValue(allocator, ast, main_index, options);
-}
 
+pub fn innerParse(comptime T: type, allocator: Allocator, ast: std.zig.Ast, node_index: std.zig.Ast.Node.Index, options: ParseOptions) !T {
+    const node = ast.nodes.get(node_index);
+    switch (@typeInfo(T)) {
+        .Bool => {
+            switch (node.tag) {
+                .identifier => {
+                    const token = ast.tokenSlice(node.main_token);
+                    if (std.mem.eql(u8, "true", token)) {
+                        return true;
+                    } else if (std.mem.eql(u8, "false", token)) {
+                        return false;
+                    } else {
+                        return error.UnexpectedToken;
+                    }
+                },
+                else => return error.UnexpectedToken,
+            }
+        },
+        .Float, .ComptimeFloat, .Int, .ComptimeInt => {
+            return numFromAst(T, allocator, ast, node_index);
+        },
+        .Optional => |optionalInfo| {
+            switch (node.tag) {
+                .identifier => {
+                    const token = ast.tokenSlice(node.main_token);
+                    if (std.mem.eql(u8, "null", token)) {
+                        return null;
+                    }
+                },
+                else => {},
+            }
+            return try innerParse(optionalInfo.child, allocator, ast, node_index, options);
+        },
+        .Enum => {
+            if (std.meta.hasFn(T, "zonParse")) {
+                return T.zonParse(allocator, ast, node_index, options);
+            }
+
+            switch (node.tag) {
+                .enum_literal => {
+                    const token = ast.tokenSlice(node.main_token);
+                    return std.meta.stringToEnum(T, token) orelse error.InvalidEnumTag;
+                },
+                else => {},
+            }
+            std.debug.print("{any}", .{node.tag});
+            return error.UnexpectedToken;
+        },
+        .Union => |unionInfo| {
+            if (std.meta.hasFn(T, "zonParse")) {
+                return T.zonParse(allocator, ast, node_index, options);
+            }
+
+            if (unionInfo.tag_type == null) @compileError("Unable to parse into untagged union '" ++ @typeName(T) ++ "'");
+
+            const isAnon = isAnonStruct(node.tag);
+            const field = field: {
+                if (isAnon) {
+                    const fields = try structFields(allocator, ast, node_index);
+                    defer allocator.free(fields);
+                    if (fields) |f| {
+                        if (f.len != 1) return error.UnexpectedToken;
+                        break :field f[0];
+                    } else {
+                        return error.UnexpectedToken;
+                    }
+                } else if (node.tag == .enum_literal) {
+                    break :field StructField{ .name = ast.tokenSlice(node_index), .expr = 0 };
+                }
+                return error.UnexpectedToken;
+            };
+            inline for (unionInfo.fields) |u_field| {
+                if (std.mem.eql(u8, u_field.name, field.name)) {
+                    if (u_field.type == void) {
+                        if (field.expr != 0) return error.UnexpectedToken; // expected an enum literal, not an object
+                        return @unionInit(T, u_field.name, {});
+                    }
+                    if (field.expr == 0) return error.UnexpectedToken; // expected an object, not an enum literal
+                    return @unionInit(T, u_field.name, try innerParse(u_field.type, allocator, ast, field.expr, options));
+                }
+            }
+
+            return error.UnknownField;
+        },
+        .Struct => |structInfo| {
+            if (structInfo.is_tuple) {
+                //
+                const nodes = try arrayElemsAlwaysSlice(allocator, ast, node_index);
+                defer allocator.free(nodes);
+                if (nodes.len != structInfo.fields.len) return error.UnexpectedToken;
+
+                var r: T = undefined;
+                // leaky stinky (arena)
+                inline for (structInfo.fields, nodes, 0..) |field, n_idx, i| {
+                    r[i] = try innerParse(field.type, allocator, ast, n_idx, options);
+                }
+
+                return r;
+            }
+
+            if (std.meta.hasFn(T, "zonParse")) {
+                return T.zonParse(allocator, ast, node_index, options);
+            }
+
+            const fields = try structFieldsAlwaysSlice(allocator, ast, node_index);
+            defer allocator.free(fields);
+            var r: T = undefined;
+            var fields_seen = [_]bool{false} ** structInfo.fields.len;
+
+            for (fields) |s_field| {
+                inline for (structInfo.fields, 0..) |field, i| {
+                    if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+                    if (std.mem.eql(u8, s_field.name, field.name)) {
+                        if (fields_seen[i]) {
+                            switch (options.duplicate_field_behavior) {
+                                .use_first => break,
+                                .@"error" => return error.DuplicateField,
+                                .use_last => {},
+                            }
+                        }
+                        @field(r, field.name) = try innerParse(field.type, allocator, ast, s_field.expr, options);
+                        fields_seen[i] = true;
+                        break;
+                    }
+                } else {
+                    if (!options.ignore_unknown_fields) return error.UnknownField;
+                }
+            }
+
+            try fillDefaultStructValues(T, &r, &fields_seen);
+            return r;
+        },
+        .Array => |arrayInfo| {
+            if (arrayInfo.child == u8) {
+                return parseStringOrArray(T, arrayInfo.len, allocator, ast, node_index, options);
+            } else {
+                return internalParseArray(T, arrayInfo.child, arrayInfo.len, allocator, ast, node_index, options);
+            }
+        },
+        .Vector => |vecInfo| {
+            return internalParseArray(T, vecInfo.child, vecInfo.len, allocator, ast, node_index, options);
+        },
+        .Pointer => |ptrInfo| {
+            switch (ptrInfo.size) {
+                .One => {
+                    const r: *ptrInfo.child = try allocator.create(ptrInfo.child);
+                    r.* = try innerParse(ptrInfo.child, allocator, ast, node_index, options);
+                    return r;
+                },
+                .Slice => {
+                    switch (node.tag) {
+                        .string_literal, .multiline_string_literal => {
+                            if (ptrInfo.child != u8) return error.UnexpectedToken;
+
+                            if (ptrInfo.sentinel) |sentinel_ptr| {
+                                var value_list = std.ArrayList(u8).init(allocator);
+                                defer value_list.deinit();
+                                try writeString(value_list.writer(), ast, node_index);
+                                return try value_list.toOwnedSliceSentinel(@as(*const u8, @ptrCast(sentinel_ptr)).*);
+                            }
+                            const res = try parseString(allocator, ast, node_index);
+
+                            return res;
+                        },
+                        else => {
+                            const elems = try arrayElemsAlwaysSlice(allocator, ast, node_index);
+                            var values = try allocator.alloc(ptrInfo.child, elems.len);
+                            for (elems, 0..) |elem, i| {
+                                values[i] = try innerParse(ptrInfo.child, allocator, ast, elem, options);
+                            }
+                        },
+                    }
+                },
+                else => @compileError("Unable to parse type '" ++ @typeName(T) ++ "'"),
+            }
+        },
+
+        else => @compileError("Unable to parse type '" ++ @typeName(T) ++ "'"),
+    }
+    unreachable;
+}
 // reminder for me: reallocate anything that needs allocated as I destroyed it!!!
 fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index: std.zig.Ast.Node.Index, options: ParseOptions) !Value {
     const node = ast.nodes.get(node_index);
     switch (node.tag) {
         .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma => {
-            const arr: []std.zig.Ast.Node.Index = switch (node.tag) {
-                .array_init_dot_two, .array_init_dot_two_comma => blk: {
-                    var buf = [_]std.zig.Ast.Node.Index{0} ** 2;
-                    const res_ast = ast.arrayInitDotTwo(&buf, node_index);
-                    if (res_ast.ast.elements.len == 0) return .empty;
-                    const realloced = try allocator.alloc(std.zig.Ast.Node.Index, res_ast.ast.elements.len);
-                    @memcpy(realloced, res_ast.ast.elements);
-                    break :blk realloced;
-                },
-                .array_init_dot, .array_init_dot_comma => blk: {
-                    const res_ast = ast.arrayInitDot(node_index);
-                    if (res_ast.ast.elements.len == 0) return .empty;
-                    const realloced = try allocator.alloc(std.zig.Ast.Node.Index, res_ast.ast.elements.len);
-                    @memcpy(realloced, res_ast.ast.elements);
-                    break :blk realloced;
-                },
-                else => unreachable,
-            };
+            const arr: []std.zig.Ast.Node.Index = try arrayElems(allocator, ast, node_index) orelse return .empty;
             defer allocator.free(arr);
-            if (arr.len == 0) return .empty;
+
             const res_arr = try allocator.alloc(Value, arr.len);
             errdefer allocator.free(res_arr);
             for (0..arr.len) |i| {
@@ -101,31 +264,7 @@ fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index:
             return .{ .array = res_arr };
         },
         .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma => {
-            const StructField = struct { name: []const u8, expr: std.zig.Ast.Node.Index };
-            const stuff: []StructField = switch (node.tag) {
-                .struct_init_dot_two, .struct_init_dot_two_comma => blk: {
-                    var buf = [_]std.zig.Ast.Node.Index{0} ** 2;
-                    const res_ast = ast.structInitDotTwo(&buf, node_index);
-                    if (res_ast.ast.fields.len == 0) return .empty;
-                    var fields = try allocator.alloc(StructField, res_ast.ast.fields.len);
-                    for (res_ast.ast.fields, 0..) |field, i| {
-                        const name_token = ast.firstToken(field) - 2;
-                        fields[i] = .{ .name = ast.tokenSlice(name_token), .expr = field };
-                    }
-                    break :blk fields;
-                },
-                .struct_init_dot, .struct_init_dot_comma => blk: {
-                    const res_ast = ast.structInitDot(node_index);
-                    if (res_ast.ast.fields.len == 0) return .empty;
-                    var fields = try allocator.alloc(StructField, res_ast.ast.fields.len);
-                    for (res_ast.ast.fields, 0..) |field, i| {
-                        const name_token = ast.firstToken(field) - 2;
-                        fields[i] = .{ .name = ast.tokenSlice(name_token), .expr = field };
-                    }
-                    break :blk fields;
-                },
-                else => unreachable,
-            };
+            const stuff: []StructField = try structFields(allocator, ast, node_index) orelse return .empty;
             defer allocator.free(stuff);
             var map = std.StringArrayHashMapUnmanaged(Value){};
             errdefer map.deinit(allocator);
@@ -238,12 +377,16 @@ fn innerParseToValue(allocator: std.mem.Allocator, ast: std.zig.Ast, node_index:
 }
 
 pub fn parseLeaky(comptime T: type, allocator: Allocator, source: anytype, options: ParseOptions) !T {
+    // TODO: pull in a custom parsing lib (?)
     var data = std.ArrayList(u8).init(allocator);
     defer data.deinit();
     try source.readAllArrayList(&data, std.math.maxInt(usize));
-    try data.append(0);
     const res = try data.toOwnedSliceSentinel(0);
-    return parseFromSliceLeaky(T, allocator, res, options);
+    defer allocator.free(res);
+    var ast = try std.zig.Ast.parse(allocator, res, .zon);
+    defer ast.deinit(allocator);
+    const main_index = ast.nodes.get(0).data.lhs;
+    return innerParse(T, allocator, ast, main_index, options);
 }
 pub fn Parsed(comptime T: type) type {
     return struct {
@@ -272,8 +415,10 @@ pub fn parse(comptime T: type, allocator: Allocator, source: anytype, options: P
 }
 
 pub fn parseFromSliceLeaky(comptime T: type, allocator: Allocator, source: [:0]const u8, options: ParseOptions) !T {
-    const value = try parseToValue(allocator, source, options);
-    return innerParseFromValue(T, allocator, value, options);
+    var ast = try std.zig.Ast.parse(allocator, source, .zon);
+    defer ast.deinit(allocator);
+    const main_index = ast.nodes.get(0).data.lhs;
+    return innerParse(T, allocator, ast, main_index, options);
 }
 
 pub fn parseFromSlice(comptime T: type, allocator: Allocator, source: [:0]const u8, options: ParseOptions) !Parsed(T) {
@@ -283,6 +428,23 @@ pub fn parseFromSlice(comptime T: type, allocator: Allocator, source: [:0]const 
     errdefer parsed.arena.deinit();
 
     parsed.value = try parseFromSliceLeaky(T, parsed.arena.allocator(), source, options);
+
+    return parsed;
+}
+
+pub fn parseFromValueLeaky(comptime T: type, allocator: Allocator, source: Value, options: ParseOptions) !T {
+    return innerParseFromValue(T, allocator, source, options);
+}
+pub fn parseFromValue(comptime T: type, allocator: Allocator, source: Value, options: ParseOptions) !Parsed(T) {
+    var parsed = Parsed(T){
+        .arena = try allocator.create(std.heap.ArenaAllocator),
+        .value = undefined,
+    };
+    errdefer allocator.destroy(parsed.arena);
+    parsed.arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer parsed.arena.deinit();
+
+    parsed.value = try parseFromValueLeaky(T, parsed.arena.allocator(), source, options);
 
     return parsed;
 }
@@ -561,7 +723,115 @@ fn numberSliceToValue(allocator: Allocator, slice: []const u8) !Value {
         } };
     } };
 }
-
+fn isAnonArray(tree: std.zig.Ast, idx: std.zig.Ast.Node.Index) bool {
+    return switch (tree.nodes.get(idx).tag) {
+        .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma => true,
+        else => isEmpty(tree, idx),
+    };
+}
+fn isAnonStruct(tree: std.zig.Ast, idx: std.zig.Ast.Node.Index) bool {
+    return switch (tree.nodes.get(idx).tag) {
+        .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma => true,
+        else => isEmpty(tree, idx),
+    };
+}
+fn isEmpty(tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) bool {
+    const node = tree.nodes.get(node_index);
+    switch (node.tag) {
+        .array_init_dot, .array_init_dot_comma => {
+            const res_ast = tree.arrayInitDot(node_index);
+            if (res_ast.ast.elements.len == 0) return true;
+        },
+        .array_init_dot_two, .array_init_dot_two_comma => {
+            var buf = [_]std.zig.Ast.Node.Index{0} ** 2;
+            const res_ast = tree.arrayInitDotTwo(&buf, node_index);
+            if (res_ast.ast.elements.len == 0) return true;
+        },
+        .struct_init_dot, .struct_init_dot_comma => {
+            const res_ast = tree.structInitDot(node_index);
+            if (res_ast.ast.fields.len == 0) return true;
+        },
+        .struct_init_dot_two, .struct_init_dot_two_comma => {
+            var buf = [_]std.zig.Ast.Node.Index{0} ** 2;
+            const res_ast = tree.structInitDotTwo(&buf, node_index);
+            if (res_ast.ast.fields.len == 0) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+const ElemExtractorError = Allocator.Error || error{UnexpectedToken};
+fn arrayElems(allocator: Allocator, tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) ElemExtractorError!?[]std.zig.Ast.Node.Index {
+    const node = tree.nodes.get(node_index);
+    switch (node.tag) {
+        .array_init_dot_comma, .array_init_dot => {
+            const res_ast = tree.arrayInitDot(node_index);
+            if (res_ast.ast.elements.len == 0) return null;
+            const realloced = try allocator.alloc(std.zig.Ast.Node.Index, res_ast.ast.elements.len);
+            @memcpy(realloced, res_ast.ast.elements);
+            return realloced;
+        },
+        .array_init_dot_two, .array_init_dot_two_comma => {
+            var buf = [_]std.zig.Ast.Node.Index{0} ** 2;
+            const res_ast = tree.arrayInitDotTwo(&buf, node_index);
+            if (res_ast.ast.elements.len == 0) return null;
+            const realloced = try allocator.alloc(std.zig.Ast.Node.Index, res_ast.ast.elements.len);
+            @memcpy(realloced, res_ast.ast.elements);
+            return realloced;
+        },
+        else => {
+            if (isEmpty(tree, node_index)) {
+                return null;
+            }
+        },
+    }
+    return error.UnexpectedToken;
+}
+fn arrayElemsAlwaysSlice(allocator: Allocator, tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) ElemExtractorError![]std.zig.Ast.Node.Index {
+    if (try arrayElems(allocator, tree, node_index)) |elems| {
+        return elems;
+    }
+    return &.{};
+}
+const StructField = struct { name: []const u8, expr: std.zig.Ast.Node.Index };
+fn structFields(allocator: Allocator, tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) ElemExtractorError!?[]StructField {
+    const node = tree.nodes.get(node_index);
+    switch (node.tag) {
+        .struct_init_dot, .struct_init_dot_comma => {
+            const res_ast = tree.structInitDot(node_index);
+            if (res_ast.ast.fields.len == 0) return null;
+            var fields = try allocator.alloc(StructField, res_ast.ast.fields.len);
+            for (res_ast.ast.fields, 0..) |field, i| {
+                const name_token = tree.firstToken(field) - 2;
+                fields[i] = .{ .name = tree.tokenSlice(name_token), .expr = field };
+            }
+            return fields;
+        },
+        .struct_init_dot_two, .struct_init_dot_two_comma => {
+            var buf = [_]std.zig.Ast.Node.Index{0} ** 2;
+            const res_ast = tree.structInitDotTwo(&buf, node_index);
+            if (res_ast.ast.fields.len == 0) return null;
+            var fields = try allocator.alloc(StructField, res_ast.ast.fields.len);
+            for (res_ast.ast.fields, 0..) |field, i| {
+                const name_token = tree.firstToken(field) - 2;
+                fields[i] = .{ .name = tree.tokenSlice(name_token), .expr = field };
+            }
+            return fields;
+        },
+        else => {
+            if (isEmpty(tree, node_index)) {
+                return null;
+            }
+        },
+    }
+    return error.UnexpectedToken;
+}
+fn structFieldsAlwaysSlice(allocator: Allocator, tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) ElemExtractorError![]StructField {
+    if (try structFields(allocator, tree, node_index)) |fields| {
+        return fields;
+    }
+    return &.{};
+}
 fn innerParseArrayFromArrayValue(
     comptime T: type,
     comptime Child: type,
@@ -578,6 +848,137 @@ fn innerParseArrayFromArrayValue(
     }
 
     return r;
+}
+fn internalParseArray(
+    comptime T: type,
+    comptime Child: type,
+    comptime len: comptime_int,
+    allocator: Allocator,
+    tree: std.zig.Ast,
+    node_index: std.zig.Ast.Node.Index,
+    options: ParseOptions,
+) !T {
+    const nodes = try arrayElemsAlwaysSlice(allocator, tree, node_index);
+    if (nodes.len != len) return error.LengthMismatch;
+    var r: T = undefined;
+    for (nodes, 0..) |node, i| {
+        r[i] = try innerParse(Child, allocator, tree, node, options);
+    }
+
+    return r;
+}
+// assumed u8
+fn parseStringOrArray(
+    comptime T: type,
+    comptime len: comptime_int,
+    allocator: Allocator,
+    tree: std.zig.Ast,
+    node_index: std.zig.Ast.Node.Index,
+    options: ParseOptions,
+) !T {
+    const node = tree.nodes.get(node_index);
+    switch (node.tag) {
+        .string_literal, .multiline_string_literal => {
+            const res = try parseString(allocator, tree, node_index);
+            defer allocator.free(res);
+            if (res.len != len) return error.LengthMismatch;
+            var r: T = undefined;
+            @memcpy(r[0..], res);
+            return r;
+        },
+        else => return internalParseArray(T, u8, len, allocator, tree, node_index, options),
+    }
+}
+fn quick_write_lit(writer: anytype, bytes: []const u8) !void {
+    switch (try std.zig.string_literal.parseWrite(writer, bytes)) {
+        .success => {},
+        .failure => return error.InvalidLiteral,
+    }
+}
+fn writeString(writer: anytype, tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) !void {
+    const node = tree.nodes.get(node_index);
+    switch (node.tag) {
+        .string_literal => {
+            const token = tree.tokenSlice(node.main_token);
+            try quick_write_lit(writer, token);
+        },
+        .multiline_string_literal => {
+            for (node.data.lhs..node.data.rhs + 1) |i| {
+                const token = tree.tokens.get(i);
+                switch (token.tag) {
+                    .string_literal => {
+                        const data = tree.tokenSlice(@intCast(i));
+                        try quick_write_lit(writer, data);
+                    },
+                    .multiline_string_literal_line => {
+                        if (i != node.data.lhs) {
+                            try writer.writeByte('\n');
+                        }
+                        const slice = tree.tokenSlice(@intCast(i));
+                        try writer.writeAll(slice[2 .. slice.len - 1]);
+                    },
+                    else => return error.UnexpectedToken,
+                }
+            }
+        },
+        else => return error.UnexpectedToken,
+    }
+}
+fn parseString(allocator: Allocator, tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) ![]u8 {
+    var list = std.ArrayList(u8).init(allocator);
+    defer list.deinit();
+    try writeString(list.writer(), tree, node_index);
+    return list.toOwnedSlice();
+}
+
+fn genericParseNum(comptime T: type, bytes: []const u8) !T {
+    std.debug.print("{s}\n", .{bytes});
+    switch (@typeInfo(T)) {
+        .Int, .ComptimeInt => {
+            return std.fmt.parseInt(T, bytes, 0);
+        },
+        .Float, .ComptimeFloat => {
+            return std.fmt.parseFloat(T, bytes);
+        },
+        else => @compileError("T must be an Int or a Float, got '" ++ @typeName(T) ++ "'"),
+    }
+}
+fn numFromAst(comptime T: type, allocator: Allocator, tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) !T {
+    const node = tree.nodes.get(node_index);
+    switch (node.tag) {
+        .negation => {
+            // fuck it we ball !!
+            // brainrot core
+            var token_arr = std.ArrayList(u8).init(allocator);
+            defer token_arr.deinit();
+            try token_arr.writer().writeByte('-');
+            try token_arr.writer().writeAll(tree.tokenSlice(node.data.lhs));
+            return genericParseNum(T, token_arr.items);
+        },
+        .number_literal => {
+            const token = tree.tokenSlice(node.main_token);
+            return genericParseNum(T, token);
+        },
+        // be quiet
+        .char_literal => {
+            switch (@typeInfo(T)) {
+                .Int, .ComptimeInt => {
+                    const token = tree.tokenSlice(node.main_token);
+                    switch (std.zig.string_literal.parseCharLiteral(token)) {
+                        .success => |c| {
+                            if (c < std.math.minInt(T)) return error.Overflow;
+                            if (c > std.math.maxInt(T)) return error.Overflow;
+                            return @as(T, @intCast(c));
+                        },
+                        .failure => return error.InvalidLiteral,
+                    }
+                },
+                else => return error.UnexpectedToken,
+            }
+        },
+        else => return error.UnexpectedToken,
+    }
+    unreachable;
 }
 
 test {
