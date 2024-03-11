@@ -155,7 +155,7 @@ pub fn isEmpty(tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) bool {
     }
     return false;
 }
-pub const ElemExtractorError = Allocator.Error || error{UnexpectedToken};
+pub const ElemExtractorError = std.zig.string_literal.ParseError || Allocator.Error || error{UnexpectedToken};
 
 pub fn arrayElems(allocator: Allocator, tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) ElemExtractorError!?[]std.zig.Ast.Node.Index {
     const node = tree.nodes.get(node_index);
@@ -189,6 +189,17 @@ pub fn arrayElemsAlwaysSlice(allocator: Allocator, tree: std.zig.Ast, node_index
     }
     return &.{};
 }
+/// Unquotes a zig identifier, if it's quoted.
+pub fn unquoteId(allocator: Allocator, id: []const u8) ![]u8 {
+    std.debug.assert(id.len != 0);
+    if (id[0] == '@') {
+        const res = try std.zig.string_literal.parseAlloc(allocator, id[1..id.len]);
+        return res;
+    }
+    const data = try allocator.alloc(u8, id.len);
+    @memcpy(data[0..], id);
+    return data;
+}
 pub const StructField = struct { name: []const u8, expr: std.zig.Ast.Node.Index };
 pub fn structFields(allocator: Allocator, tree: std.zig.Ast, node_index: std.zig.Ast.Node.Index) ElemExtractorError!?[]StructField {
     const node = tree.nodes.get(node_index);
@@ -199,7 +210,8 @@ pub fn structFields(allocator: Allocator, tree: std.zig.Ast, node_index: std.zig
             var fields = try allocator.alloc(StructField, res_ast.ast.fields.len);
             for (res_ast.ast.fields, 0..) |field, i| {
                 const name_token = tree.firstToken(field) - 2;
-                fields[i] = .{ .name = tree.tokenSlice(name_token), .expr = field };
+
+                fields[i] = .{ .name = try unquoteId(allocator, tree.tokenSlice(name_token)), .expr = field };
             }
             return fields;
         },
@@ -210,7 +222,7 @@ pub fn structFields(allocator: Allocator, tree: std.zig.Ast, node_index: std.zig
             var fields = try allocator.alloc(StructField, res_ast.ast.fields.len);
             for (res_ast.ast.fields, 0..) |field, i| {
                 const name_token = tree.firstToken(field) - 2;
-                fields[i] = .{ .name = tree.tokenSlice(name_token), .expr = field };
+                fields[i] = .{ .name = try unquoteId(allocator, tree.tokenSlice(name_token)), .expr = field };
             }
             return fields;
         },

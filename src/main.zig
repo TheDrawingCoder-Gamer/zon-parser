@@ -111,10 +111,9 @@ pub fn innerParse(comptime T: type, allocator: Allocator, tree: std.zig.Ast, nod
             switch (node.tag) {
                 .enum_literal => {
                     const token = tree.tokenSlice(node.main_token);
-                    var list = std.ArrayList(u8).init(allocator);
-                    defer list.deinit();
-                    try std.zig.fmtId(token).format("", .{}, list.writer());
-                    return std.meta.stringToEnum(T, list.items) orelse error.InvalidEnumTag;
+                    const name = try ast.unquoteId(allocator, token);
+                    defer allocator.free(name);
+                    return std.meta.stringToEnum(T, name) orelse error.InvalidEnumTag;
                 },
                 else => {},
             }
@@ -124,25 +123,37 @@ pub fn innerParse(comptime T: type, allocator: Allocator, tree: std.zig.Ast, nod
             if (std.meta.hasFn(T, "zonParse")) {
                 return T.zonParse(allocator, tree, node_index, options);
             }
-
             if (unionInfo.tag_type == null) @compileError("Unable to parse into untagged union '" ++ @typeName(T) ++ "'");
 
             const isAnon = isAnonStruct(node.tag);
             const field = field: {
                 if (isAnon) {
                     const fields = try structFields(allocator, tree, node_index);
-                    defer allocator.free(fields);
+                    defer if (fields) |f| {
+                        allocator.free(f);
+                    };
+                    errdefer {
+                        if (fields) |f| {
+                            for (f) |field| {
+                                allocator.free(field.name);
+                            }
+                        }
+                    }
                     if (fields) |f| {
                         if (f.len != 1) return error.UnexpectedToken;
+                        for (f[1..]) |field| {
+                            allocator.free(field.name);
+                        }
                         break :field f[0];
                     } else {
                         return error.UnexpectedToken;
                     }
                 } else if (node.tag == .enum_literal) {
-                    break :field StructField{ .name = tree.tokenSlice(node_index), .expr = 0 };
+                    break :field StructField{ .name = try ast.unquoteId(allocator, tree.tokenSlice(node_index)), .expr = 0 };
                 }
                 return error.UnexpectedToken;
             };
+            defer allocator.free(field.name);
             inline for (unionInfo.fields) |u_field| {
                 if (std.mem.eql(u8, u_field.name, field.name)) {
                     if (u_field.type == void) {
@@ -178,6 +189,11 @@ pub fn innerParse(comptime T: type, allocator: Allocator, tree: std.zig.Ast, nod
 
             const fields = try structFieldsAlwaysSlice(allocator, tree, node_index);
             defer allocator.free(fields);
+            defer {
+                for (fields) |f| {
+                    allocator.free(f.name);
+                }
+            }
             var r: T = undefined;
             var fields_seen = [_]bool{false} ** structInfo.fields.len;
 
